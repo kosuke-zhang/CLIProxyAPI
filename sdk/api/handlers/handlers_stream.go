@@ -5,12 +5,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"golang.org/x/net/context"
+)
+
+var (
+	streamingFirstByteTimeout      = 30 * time.Second
+	streamingRetryFirstByteTimeout = 60 * time.Second
 )
 
 // ExecuteStreamWithAuthManager executes a streaming request via the core auth manager.
@@ -251,6 +260,22 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	var selectedAuthMu sync.Mutex
+	selectedAuthID := ""
+	selectedAuthCallback, _ := reqMeta[coreexecutor.SelectedAuthCallbackMetadataKey].(func(string))
+	reqMeta[coreexecutor.SelectedAuthCallbackMetadataKey] = func(authID string) {
+		selectedAuthMu.Lock()
+		selectedAuthID = strings.TrimSpace(authID)
+		selectedAuthMu.Unlock()
+		if selectedAuthCallback != nil {
+			selectedAuthCallback(authID)
+		}
+	}
+	currentSelectedAuthID := func() string {
+		selectedAuthMu.Lock()
+		defer selectedAuthMu.Unlock()
+		return selectedAuthID
+	}
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
@@ -286,7 +311,58 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		close(errChan)
 		return nil, nil, errChan
 	}
-	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+	type streamAttemptResult struct {
+		result *coreexecutor.StreamResult
+		err    error
+	}
+	executeStreamAttempt := func(attemptOpts coreexecutor.Options, firstByteTimeout time.Duration) (*coreexecutor.StreamResult, error, bool) {
+		attemptCtx := ctx
+		if attemptCtx == nil {
+			attemptCtx = context.Background()
+		}
+		attemptCtx, cancel := context.WithCancel(attemptCtx)
+		resultChan := make(chan streamAttemptResult, 1)
+		go func() {
+			result, err := h.AuthManager.ExecuteStream(attemptCtx, providers, req, attemptOpts)
+			resultChan <- streamAttemptResult{result: result, err: err}
+		}()
+
+		timer := time.NewTimer(firstByteTimeout)
+		defer timer.Stop()
+		select {
+		case result := <-resultChan:
+			return result.result, result.err, false
+		case <-timer.C:
+			cancel()
+			return nil, &coreauth.Error{
+				Code:       "first_byte_timeout",
+				Message:    fmt.Sprintf("upstream first byte timeout after %s", firstByteTimeout),
+				Retryable:  true,
+				HTTPStatus: http.StatusGatewayTimeout,
+			}, true
+		case <-attemptCtx.Done():
+			cancel()
+			return nil, attemptCtx.Err(), false
+		}
+	}
+
+	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+	bootstrapRetries := 0
+	streamResult, err, firstByteTimedOut := executeStreamAttempt(opts, streamingFirstByteTimeout)
+	for firstByteTimedOut && bootstrapRetries < maxBootstrapRetries {
+		authID := currentSelectedAuthID()
+		if authID == "" {
+			break
+		}
+		bootstrapRetries++
+		retryMetadata := make(map[string]any, len(opts.Metadata)+1)
+		for key, value := range opts.Metadata {
+			retryMetadata[key] = value
+		}
+		retryMetadata[coreexecutor.PinnedAuthMetadataKey] = authID
+		opts.Metadata = retryMetadata
+		streamResult, err, firstByteTimedOut = executeStreamAttempt(opts, streamingRetryFirstByteTimeout)
+	}
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errMsg := executionErrorMessage(err)
@@ -445,11 +521,10 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		}
 	}
 
-	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
 	if h.AuthManager.HomeEnabled() {
 		maxBootstrapRetries = 0
 	}
-	for bootstrapRetries := 0; !streamCanceledBeforeRead; {
+	for !streamCanceledBeforeRead {
 		readInitialStreamChunks()
 		if streamCanceledBeforeRead || bootstrapErr != nil || bootstrapStreamErr == nil {
 			break
