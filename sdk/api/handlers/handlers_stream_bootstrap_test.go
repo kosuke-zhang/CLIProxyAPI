@@ -141,6 +141,13 @@ type authAwareStreamExecutor struct {
 	authIDs []string
 }
 
+type firstByteTimeoutStreamExecutor struct {
+	mu         sync.Mutex
+	calls      int
+	authIDs    []string
+	retryDelay time.Duration
+}
+
 type invalidJSONStreamExecutor struct{}
 
 type splitResponsesEventStreamExecutor struct{}
@@ -272,6 +279,132 @@ func (e *authAwareStreamExecutor) AuthIDs() []string {
 	out := make([]string, len(e.authIDs))
 	copy(out, e.authIDs)
 	return out
+}
+
+func (e *firstByteTimeoutStreamExecutor) Identifier() string { return "codex" }
+
+func (e *firstByteTimeoutStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
+}
+
+func (e *firstByteTimeoutStreamExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+
+	e.mu.Lock()
+	e.calls++
+	call := e.calls
+	e.authIDs = append(e.authIDs, authID)
+	retryDelay := e.retryDelay
+	e.mu.Unlock()
+
+	ch := make(chan coreexecutor.StreamChunk, 1)
+	if call == 1 {
+		go func() {
+			<-ctx.Done()
+			close(ch)
+		}()
+		return &coreexecutor.StreamResult{Chunks: ch}, nil
+	}
+
+	go func() {
+		timer := time.NewTimer(retryDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			close(ch)
+		case <-timer.C:
+			ch <- coreexecutor.StreamChunk{Payload: []byte("ok")}
+			close(ch)
+		}
+	}()
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *firstByteTimeoutStreamExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *firstByteTimeoutStreamExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *firstByteTimeoutStreamExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{Code: "not_implemented", Message: "HttpRequest not implemented", HTTPStatus: http.StatusNotImplemented}
+}
+
+func (e *firstByteTimeoutStreamExecutor) AuthIDs() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.authIDs))
+	copy(out, e.authIDs)
+	return out
+}
+
+func TestExecuteStreamWithAuthManager_FirstByteTimeoutRetriesSameAuth(t *testing.T) {
+	previousInitialTimeout := streamingFirstByteTimeout
+	previousRetryTimeout := streamingRetryFirstByteTimeout
+	streamingFirstByteTimeout = 25 * time.Millisecond
+	streamingRetryFirstByteTimeout = 100 * time.Millisecond
+	t.Cleanup(func() {
+		streamingFirstByteTimeout = previousInitialTimeout
+		streamingRetryFirstByteTimeout = previousRetryTimeout
+	})
+
+	executor := &firstByteTimeoutStreamExecutor{retryDelay: 60 * time.Millisecond}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth1 := &coreauth.Auth{ID: "auth1", Provider: "codex", Status: coreauth.StatusActive}
+	auth2 := &coreauth.Auth{ID: "auth2", Provider: "codex", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth1); err != nil {
+		t.Fatalf("manager.Register(auth1): %v", err)
+	}
+	if _, err := manager.Register(context.Background(), auth2); err != nil {
+		t.Fatalf("manager.Register(auth2): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth1.ID, auth1.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	registry.GetGlobalRegistry().RegisterClient(auth2.ID, auth2.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth1.ID)
+		registry.GetGlobalRegistry().UnregisterClient(auth2.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 1},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+	if string(got) != "ok" {
+		t.Fatalf("payload = %q, want ok", string(got))
+	}
+
+	authIDs := executor.AuthIDs()
+	if len(authIDs) != 2 {
+		t.Fatalf("auth attempts = %v, want exactly two", authIDs)
+	}
+	if authIDs[0] == "" || authIDs[1] != authIDs[0] {
+		t.Fatalf("auth attempts = %v, want the same auth twice", authIDs)
+	}
+	selectedAuth, ok := manager.GetByID(authIDs[0])
+	if !ok {
+		t.Fatalf("selected auth %q not found", authIDs[0])
+	}
+	if selectedAuth.Status != coreauth.StatusActive || selectedAuth.Unavailable {
+		t.Fatalf("selected auth changed state: status=%q unavailable=%v", selectedAuth.Status, selectedAuth.Unavailable)
+	}
 }
 
 func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
