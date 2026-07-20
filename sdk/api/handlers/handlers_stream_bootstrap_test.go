@@ -142,10 +142,11 @@ type authAwareStreamExecutor struct {
 }
 
 type firstByteTimeoutStreamExecutor struct {
-	mu         sync.Mutex
-	calls      int
-	authIDs    []string
-	retryDelay time.Duration
+	mu            sync.Mutex
+	calls         int
+	authIDs       []string
+	pinnedAuthIDs []string
+	retryDelay    time.Duration
 }
 
 type invalidJSONStreamExecutor struct{}
@@ -287,16 +288,18 @@ func (e *firstByteTimeoutStreamExecutor) Execute(context.Context, *coreauth.Auth
 	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
 }
 
-func (e *firstByteTimeoutStreamExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+func (e *firstByteTimeoutStreamExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, _ coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 	authID := ""
 	if auth != nil {
 		authID = auth.ID
 	}
+	pinnedAuthID, _ := opts.Metadata[coreexecutor.PinnedAuthMetadataKey].(string)
 
 	e.mu.Lock()
 	e.calls++
 	call := e.calls
 	e.authIDs = append(e.authIDs, authID)
+	e.pinnedAuthIDs = append(e.pinnedAuthIDs, pinnedAuthID)
 	retryDelay := e.retryDelay
 	e.mu.Unlock()
 
@@ -340,6 +343,14 @@ func (e *firstByteTimeoutStreamExecutor) AuthIDs() []string {
 	defer e.mu.Unlock()
 	out := make([]string, len(e.authIDs))
 	copy(out, e.authIDs)
+	return out
+}
+
+func (e *firstByteTimeoutStreamExecutor) PinnedAuthIDs() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.pinnedAuthIDs))
+	copy(out, e.pinnedAuthIDs)
 	return out
 }
 
@@ -398,12 +409,59 @@ func TestExecuteStreamWithAuthManager_FirstByteTimeoutRetriesSameAuth(t *testing
 	if authIDs[0] == "" || authIDs[1] != authIDs[0] {
 		t.Fatalf("auth attempts = %v, want the same auth twice", authIDs)
 	}
+	pinnedAuthIDs := executor.PinnedAuthIDs()
+	if len(pinnedAuthIDs) != 2 || pinnedAuthIDs[0] != "" || pinnedAuthIDs[1] != authIDs[0] {
+		t.Fatalf("pinned auth attempts = %v, want only retry pinned to %q", pinnedAuthIDs, authIDs[0])
+	}
 	selectedAuth, ok := manager.GetByID(authIDs[0])
 	if !ok {
 		t.Fatalf("selected auth %q not found", authIDs[0])
 	}
 	if selectedAuth.Status != coreauth.StatusActive || selectedAuth.Unavailable {
 		t.Fatalf("selected auth changed state: status=%q unavailable=%v", selectedAuth.Status, selectedAuth.Unavailable)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_FirstByteTimeoutRetriesOnlyOnce(t *testing.T) {
+	previousInitialTimeout := streamingFirstByteTimeout
+	previousRetryTimeout := streamingRetryFirstByteTimeout
+	streamingFirstByteTimeout = 25 * time.Millisecond
+	streamingRetryFirstByteTimeout = 50 * time.Millisecond
+	t.Cleanup(func() {
+		streamingFirstByteTimeout = previousInitialTimeout
+		streamingRetryFirstByteTimeout = previousRetryTimeout
+	})
+
+	executor := &firstByteTimeoutStreamExecutor{retryDelay: time.Second}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{ID: "auth1", Provider: "codex", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(auth): %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{BootstrapRetries: 3},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+	if dataChan != nil {
+		t.Fatalf("data channel is non-nil after first-byte timeout")
+	}
+
+	var gotErr *interfaces.ErrorMessage
+	for msg := range errChan {
+		gotErr = msg
+	}
+	if gotErr == nil || gotErr.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("error = %+v, want status %d", gotErr, http.StatusGatewayTimeout)
+	}
+	if authIDs := executor.AuthIDs(); len(authIDs) != 2 {
+		t.Fatalf("auth attempts = %v, want exactly two despite bootstrap-retries=3", authIDs)
 	}
 }
 

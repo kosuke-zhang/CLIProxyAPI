@@ -1245,19 +1245,19 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
 	bootstrapRetries := 0
 	streamResult, err, firstByteTimedOut := executeStreamAttempt(opts, streamingFirstByteTimeout)
-	for firstByteTimedOut && bootstrapRetries < maxBootstrapRetries {
+	if firstByteTimedOut && maxBootstrapRetries > 0 {
 		authID := currentSelectedAuthID()
-		if authID == "" {
-			break
+		if authID != "" {
+			bootstrapRetries++
+			retryOpts := opts
+			retryMetadata := make(map[string]any, len(opts.Metadata)+1)
+			for key, value := range opts.Metadata {
+				retryMetadata[key] = value
+			}
+			retryMetadata[coreexecutor.PinnedAuthMetadataKey] = authID
+			retryOpts.Metadata = retryMetadata
+			streamResult, err, _ = executeStreamAttempt(retryOpts, streamingRetryFirstByteTimeout)
 		}
-		bootstrapRetries++
-		retryMetadata := make(map[string]any, len(opts.Metadata)+1)
-		for key, value := range opts.Metadata {
-			retryMetadata[key] = value
-		}
-		retryMetadata[coreexecutor.PinnedAuthMetadataKey] = authID
-		opts.Metadata = retryMetadata
-		streamResult, err, firstByteTimedOut = executeStreamAttempt(opts, streamingRetryFirstByteTimeout)
 	}
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
