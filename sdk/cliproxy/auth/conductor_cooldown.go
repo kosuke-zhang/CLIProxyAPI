@@ -27,6 +27,8 @@ var quotaCooldownDisabled atomic.Bool
 
 var transientErrorCooldownSeconds atomic.Int64
 
+const codexNotFoundCooldown = 5 * time.Minute
+
 // SetQuotaCooldownDisabled toggles auth/model cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
 	quotaCooldownDisabled.Store(disable)
@@ -123,6 +125,15 @@ func recoverableFailureRetryAfterWithHint(now time.Time, retryAfter *time.Durati
 	return now.Add(time.Duration(seconds) * time.Second)
 }
 
+func notFoundRetryAfter(auth *Auth, now time.Time, disableCooling bool) time.Time {
+	if disableCooling {
+		return time.Time{}
+	}
+	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return now.Add(codexNotFoundCooldown)
+	}
+	return now.Add(12 * time.Hour)
+}
 // SetConfig updates the runtime config snapshot used by request-time helpers.
 // Callers should provide the latest config on reload so per-credential alias mapping stays in sync.
 func (m *Manager) SetConfig(cfg *internalconfig.Config) {
@@ -859,12 +870,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								state.NextRetryAfter = next
 							}
 						case 404:
-							if disableCooling {
-								state.NextRetryAfter = time.Time{}
-							} else {
-								next := now.Add(12 * time.Hour)
-								state.NextRetryAfter = next
-							}
+							state.NextRetryAfter = notFoundRetryAfter(auth, now, disableCooling)
 						case 429:
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
@@ -2204,11 +2210,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			}
 		case 404:
 			auth.StatusMessage = "not_found"
-			if disableCooling {
-				auth.NextRetryAfter = time.Time{}
-			} else {
-				auth.NextRetryAfter = now.Add(12 * time.Hour)
-			}
+			auth.NextRetryAfter = notFoundRetryAfter(auth, now, disableCooling)
 		case 429:
 			auth.StatusMessage = "quota exhausted"
 			auth.Quota.Exceeded = true
